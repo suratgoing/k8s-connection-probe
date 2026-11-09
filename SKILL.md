@@ -1,6 +1,6 @@
 ---
 name: k8s-connection-probe
-description: Before deploying a service to a Kubernetes environment, find every outbound connection it needs (databases, Kafka topics and consumer groups, Redis, object storage, SFTP, HTTP APIs and gateways) and prove each one live from a throwaway pod inside the same cluster, with the service's own identity. Output is a per-connection verdict with the exact error, the failing layer, and who has to fix it (platform/DevOps team vs. your own config or code), plus a ready-to-send request for the platform team. Use when someone asks "what will break when I deploy this?", "check the connections of <service>", "why can't my pod reach X", "do I have the right Kafka ACLs", "what do I need to ask DevOps for", or is about to migrate a service to a new cluster, cloud or environment — even before the code is finished.
+description: Before deploying a service to a Kubernetes environment, find every outbound connection it needs (PostgreSQL/MySQL databases, Redis, Kafka topics and consumer groups, object storage, SFTP, HTTP APIs and gateways) and prove each one live from a throwaway pod inside the same cluster, with the service's own identity. Output is a per-connection verdict with the exact error, the failing layer, and who has to fix it (platform/DevOps team vs. your own config or code), plus a ready-to-send request for the platform team. Use when someone asks "what will break when I deploy this?", "check the connections of <service>", "why can't my pod reach X", "do I have the right Kafka ACLs", "what do I need to ask DevOps for", or is about to migrate a service to a new cluster, cloud or environment — even before the code is finished.
 ---
 
 # k8s-connection-probe
@@ -65,9 +65,20 @@ For an HTTP 404 behind a gateway, probe **twice** — without and with the heade
 404 → 200 means the route exists and your request is missing something (you fix it); 404 → 404 means
 the route itself is missing (platform team). Status codes alone cannot tell these apart.
 
-Database / Redis / object-storage clients are not in netshoot: use `tcp` + `tls` for the network
-layers, then run the client briefly in a pod with the service's identity (e.g. `psql`, `mysql`,
-`redis-cli PING`, `aws s3 ls`) and report the exact error.
+Databases and Redis have their own client pods (same `--like` identity), so the check goes past
+"port open" to "can this user log in, reach this database, and do what the service does":
+```bash
+$P client-up redis --like <deployment>
+$P redis orders-cache 6379 --pass-env REDIS_PASS            # REDIS_OK | AUTH_REQUIRED | AUTH_FAILED | ...
+$P client-up postgres --like <deployment>
+$P postgres orders-db 5432 orders --user-env PG_USER --pass-env PG_PASS     # PG_OK | DB_NOT_FOUND | ...
+$P client-up mysql --like <deployment>
+$P mysql billing-db 3306 billing --user-env DB_USER --pass-env DB_PASS --grants   # + CAN_WRITE | READ_ONLY
+```
+`--grants` matters: "login works" is not "the service can INSERT". A read-only user is a config fix
+(point at the user that can write) or a grant request — the probe tells you which before deploy.
+Object storage (S3/GCS) is not built in: run the cloud CLI briefly in a pod with the service's
+identity (e.g. `aws s3 ls s3://bucket/prefix/`) and report the exact error.
 
 ### 5. Sort and report
 Put every dependency in exactly one group:

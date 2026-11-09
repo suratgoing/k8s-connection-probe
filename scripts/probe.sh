@@ -17,6 +17,18 @@
 #                                          layer 4–6 Kafka       -> META_OK | READ_OK | GROUP_JOIN_OK | TOPIC_AUTH_FAILED |
 #                                                                   GROUP_AUTH_FAILED | AUTH_FAILED | TLS_FAILED |
 #                                                                   TOPIC_NOT_FOUND | BROKER_UNREACHABLE | NO_ERROR_IN_<n>S
+#   client-up <redis|postgres|mysql> [--like <deployment>]
+#                                          start a database client pod (same identity options as up)
+#   redis <host> <port> [--tls] [--pass-env VAR]
+#                                          layer 2–5 Redis       -> REDIS_OK | AUTH_REQUIRED | AUTH_FAILED | PERMISSION_DENIED |
+#                                                                   REFUSED | UNREACHABLE | NO_DNS
+#   postgres <host> <port> <db> --user-env U --pass-env P [--sslmode require]
+#                                          layer 2–6 PostgreSQL  -> PG_OK | AUTH_FAILED | DB_NOT_FOUND | PERMISSION_DENIED |
+#                                                                   NOT_ALLOWED_FROM_HERE | REFUSED | UNREACHABLE | NO_DNS
+#   mysql <host> <port> <db> --user-env U --pass-env P [--grants]
+#                                          layer 2–6 MySQL       -> MYSQL_OK | AUTH_FAILED | DB_NOT_FOUND | PERMISSION_DENIED |
+#                                                                   UNREACHABLE | NO_DNS · --grants adds GRANT lines and
+#                                                                   CAN_WRITE | READ_ONLY (no INSERT/UPDATE/DELETE)
 #   down                                   delete every probe pod (always run this at the end)
 #
 # Credentials are never printed. Pass them as env names expanded INSIDE the pod, e.g.
@@ -26,6 +38,9 @@ set -euo pipefail
 
 NETSHOOT_IMAGE="${NETSHOOT_IMAGE:-nicolaka/netshoot:v0.13}"
 KCAT_IMAGE="${KCAT_IMAGE:-edenhill/kcat:1.7.1}"
+REDIS_IMAGE="${REDIS_IMAGE:-redis:7.4-alpine}"
+POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16-alpine}"
+MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.4}"
 POD="conn-probe" KPOD="conn-probe-kcat" LABEL="app.kubernetes.io/name=conn-probe"
 CTX="" NS="" DRY=0
 
@@ -136,6 +151,53 @@ case "$CMD" in
     elif [ "$mode" = group ]; then echo "NO_ERROR_IN_15S group $g   (joined without an auth error — not proof that reads work)"
     elif echo "$out" | grep -q "rc=0"; then [ "$mode" = meta ] && echo "META_OK $t" || echo "READ_OK $t"
     else echo "UNKNOWN   $(echo "$out" | grep -v '^rc=' | tail -2 | tr '\n' ' ' | cut -c1-160)"; fi ;;
+  client-up)
+    kind="${1:?redis|postgres|mysql}"; shift
+    case "$kind" in redis) img="$REDIS_IMAGE" ;; postgres) img="$POSTGRES_IMAGE" ;; mysql) img="$MYSQL_IMAGE" ;; *) die "client must be redis, postgres or mysql" ;; esac
+    start_pod "conn-probe-$kind" "$img" "$@" ;;
+  redis)
+    h="${1:?host}" p="${2:?port}"; shift 2; tls="" auth=""
+    while [ $# -gt 0 ]; do case "$1" in --tls) tls="--tls --insecure"; shift ;; --pass-env) auth="--no-auth-warning -a \"\$$2\""; shift 2 ;; *) shift ;; esac; done
+    # redis-cli hangs silently on an unknown host, so resolve the name first. busybox nslookup ignores the
+    # cluster search domains (short Service names fail); ping uses the normal resolver and says "bad address".
+    out=$(kx conn-probe-redis "ping -c 1 -W 1 $(q "$h") 2>&1 | grep -qi 'bad address' && { echo NO_DNS_MARK; exit 0; }; timeout 8 redis-cli -h $(q "$h") -p $(q "$p") $tls $auth PING 2>&1; echo rc=\$?")
+    if   echo "$out" | grep -q "NO_DNS_MARK";                          then echo "NO_DNS $h"
+    elif echo "$out" | grep -q "^PONG";                                then echo "REDIS_OK $h:$p"
+    elif echo "$out" | grep -qiE "WRONGPASS|invalid password|invalid username"; then echo "AUTH_FAILED $h:$p   (password / ACL user rejected)"
+    elif echo "$out" | grep -qi "NOAUTH";                               then echo "AUTH_REQUIRED $h:$p   (server needs a password; the client sent none)"
+    elif echo "$out" | grep -qi "NOPERM";                               then echo "PERMISSION_DENIED $h:$p   (ACL user may not run this command)"
+    elif echo "$out" | grep -qi "refused";                              then echo "REFUSED $h:$p"
+    else echo "UNREACHABLE $h:$p   (timeout, firewall, or TLS required: try --tls)"; fi ;;
+  postgres)
+    h="${1:?host}" p="${2:?port}" db="${3:?database}"; shift 3; u="" pw="" ssl="prefer"
+    while [ $# -gt 0 ]; do case "$1" in --user-env) u="$2"; shift 2 ;; --pass-env) pw="$2"; shift 2 ;; --sslmode) ssl="$2"; shift 2 ;; *) shift ;; esac; done
+    [ -n "$u" ] && [ -n "$pw" ] || die "postgres needs --user-env and --pass-env (names of env vars inside the pod)"
+    out=$(kx conn-probe-postgres "PGCONNECT_TIMEOUT=6 PGPASSWORD=\"\$$pw\" psql \"host=$h port=$p dbname=$db user=\$$u sslmode=$ssl\" -tAc 'select 1' 2>&1")
+    if   echo "$out" | grep -qx "1";                                         then echo "PG_OK $h:$p/$db"
+    elif echo "$out" | grep -qi "password authentication failed";            then echo "AUTH_FAILED $h:$p   (user/password rejected)"
+    elif echo "$out" | grep -qi "does not exist";                            then echo "DB_NOT_FOUND $db   (wrong database name for this env, or not created)"
+    elif echo "$out" | grep -qiE "permission denied for database|CONNECT privilege"; then echo "PERMISSION_DENIED $db   (user may not connect to this database)"
+    elif echo "$out" | grep -qi "no pg_hba.conf entry";                      then echo "NOT_ALLOWED_FROM_HERE $h:$p   (server rejects this client address / SSL mode)"
+    elif echo "$out" | grep -qiE "could not translate host name";            then echo "NO_DNS $h"
+    elif echo "$out" | grep -qi "refused";                                   then echo "REFUSED $h:$p"
+    else echo "UNREACHABLE $h:$p   ($(echo "$out" | tail -1 | cut -c1-100))"; fi ;;
+  mysql)
+    h="${1:?host}" p="${2:?port}" db="${3:?database}"; shift 3; u="" pw="" grants=0
+    while [ $# -gt 0 ]; do case "$1" in --user-env) u="$2"; shift 2 ;; --pass-env) pw="$2"; shift 2 ;; --grants) grants=1; shift ;; *) shift ;; esac; done
+    [ -n "$u" ] && [ -n "$pw" ] || die "mysql needs --user-env and --pass-env (names of env vars inside the pod)"
+    base="MYSQL_PWD=\"\$$pw\" mysql -h $(q "$h") -P $(q "$p") -u \"\$$u\" --connect-timeout=6 -N -B"
+    out=$(kx conn-probe-mysql "$base -e 'select 1' $(q "$db") 2>&1")
+    if   echo "$out" | grep -qx "1"; then echo "MYSQL_OK $h:$p/$db"
+      if [ "$grants" = 1 ]; then
+        g=$(kx conn-probe-mysql "$base -e 'SHOW GRANTS' 2>&1" | tr -d '`')
+        echo "$g" | sed 's/^/GRANT: /' | sed 's/^GRANT: GRANT /GRANT: /'
+        if echo "$g" | grep -qiE "ALL PRIVILEGES|INSERT"; then echo "CAN_WRITE"; else echo "READ_ONLY   (no INSERT/UPDATE/DELETE: use a user that can write, or ask for the grant)"; fi
+      fi
+    elif echo "$out" | grep -q "ERROR 1045"; then echo "AUTH_FAILED $h:$p   (user/password rejected)"
+    elif echo "$out" | grep -q "ERROR 1044"; then echo "PERMISSION_DENIED $db   (no access to this database, or it does not exist — MySQL hides which from users without access)"
+    elif echo "$out" | grep -q "ERROR 1049"; then echo "DB_NOT_FOUND $db   (wrong database name for this env, or not created)"
+    elif echo "$out" | grep -q "ERROR 2005"; then echo "NO_DNS $h"
+    else echo "UNREACHABLE $h:$p   ($(echo "$out" | tail -1 | cut -c1-100))"; fi ;;
   down) k delete pod -l "$LABEL" --wait=false --ignore-not-found ;;
   *) die "unknown command '$CMD' (try --help)" ;;
 esac

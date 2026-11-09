@@ -1,6 +1,6 @@
 # k8s-connection-probe
 
-**Probe ก่อน Deploy** — Claude skill ที่หาว่า service ต้องต่อกับอะไรบ้าง แล้วยิงทดสอบทุกการเชื่อมต่อจาก pod ชั่วคราวใน cluster จริง ด้วยตัวตนเดียวกับ service ก่อนจะ deploy
+**Probe ก่อน Deploy** — Claude skill ที่หาว่า service ต้องต่อกับอะไรบ้าง (database, Redis, Kafka, API, …) แล้วยิงทดสอบทุกการเชื่อมต่อจาก pod ชั่วคราวใน cluster จริง ด้วยตัวตนเดียวกับ service ก่อนจะ deploy
 
 🎬 คลิปอธิบาย: https://youtube.com/shorts/69UYRKZAr70
 
@@ -18,7 +18,7 @@ git clone https://github.com/suratgoing/k8s-connection-probe ~/.claude/skills/k8
 ### ต้องมี
 - `kubectl` ที่เข้า cluster ปลายทางได้ และมีสิทธิ์สร้าง / exec / ลบ pod ใน namespace นั้น
 - `python3` (ใช้สร้าง pod spec)
-- cluster ต้องดึง image `nicolaka/netshoot` และ `edenhill/kcat` ได้ (เปลี่ยนเป็น registry ตัวเองได้ด้วย `NETSHOOT_IMAGE` / `KCAT_IMAGE`)
+- cluster ต้องดึง image `nicolaka/netshoot`, `edenhill/kcat`, `redis`, `postgres`, `mysql` ได้ (เปลี่ยนเป็น registry ตัวเองได้ด้วย `NETSHOOT_IMAGE` / `KCAT_IMAGE` / `REDIS_IMAGE` / `POSTGRES_IMAGE` / `MYSQL_IMAGE`)
 
 ## ใช้สคริปต์ตรงๆ (ไม่ผ่าน Claude ก็ได้)
 ```bash
@@ -29,6 +29,10 @@ $P dns  db.example.internal        # DNS_OK 10.0.3.12
 $P tcp  db.example.internal 5432   # OPEN | REFUSED | BLOCKED_OR_TIMEOUT
 $P tls  kafka.example.internal 9093
 $P http https://api.example.internal/v1/ping -H 'X-Source: orders'
+$P client-up redis --like orders-api
+$P redis orders-cache 6379 --pass-env REDIS_PASS          # REDIS_OK | AUTH_REQUIRED | AUTH_FAILED
+$P client-up mysql --like orders-api
+$P mysql billing-db 3306 billing --user-env DB_USER --pass-env DB_PASS --grants   # MYSQL_OK + READ_ONLY | CAN_WRITE
 $P kafka-up --like orders-api
 $P kafka read kafka.example.internal:9093 orders -- -X security.protocol=SASL_SSL -X sasl.mechanisms=SCRAM-SHA-512 \
      -X sasl.username='$KAFKA_USER' -X sasl.password='$KAFKA_PASS'

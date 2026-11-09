@@ -22,6 +22,11 @@ Every connection climbs these layers in order. An error reports only the first l
 | `TLS_HANDSHAKE_FAILED` | 3 | no TLS agreement (plain-text port, protocol mismatch, mTLS required) | config / library |
 | `TLS_VERIFY_FAILED` | 3 | server cert not trusted with the CA you use | get the right CA bundle |
 | `AUTH_FAILED` | 4 | credentials rejected | wrong secret wired, or not issued yet |
+| `AUTH_REQUIRED` (Redis) | 4 | server needs a password, client sent none | wire the password into config |
+| `READ_ONLY` (MySQL `--grants`) | 5 | login works, no INSERT/UPDATE/DELETE | use the user that can write, or ask for the grant |
+| `PERMISSION_DENIED` | 5 | identity may not use this database / command | ask for the grant / ACL |
+| `DB_NOT_FOUND` | 6 | database name wrong for this env, or not created | fix config / ask for the database |
+| `NOT_ALLOWED_FROM_HERE` (Postgres) | 2/5 | `pg_hba.conf` rejects this client address or SSL mode | ask the DB owner |
 | `TOPIC_AUTH_FAILED` | 5 | identity lacks READ/DESCRIBE on topic | ask platform for the ACL |
 | `TOPIC_NOT_FOUND` | 7 | topic name is wrong for this env, or it was never created | fix config / ask for the topic |
 | `GROUP_AUTH_FAILED` | 6 | topic OK, consumer group not allowed | ask platform for the group ACL |
